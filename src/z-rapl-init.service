@@ -1,0 +1,12 @@
+[Unit]
+Description=Initialize Intel RAPL power limits
+ConditionPathExists=/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw
+Before=thermald.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/z-rapl-init
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

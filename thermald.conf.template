@@ -1,0 +1,3 @@
+[Unit]
+Wants=z-rapl-init.service
+After=z-rapl-init.service

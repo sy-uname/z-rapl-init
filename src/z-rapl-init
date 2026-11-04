@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+MY_NAME=$(basename "$0")
+readonly MY_NAME
+readonly RC_OK=0
+readonly RC_ERROR=1
+readonly RC_BAD_OPT=2
+readonly DEFAULT_CONFIG_DIR="/etc/default"
+readonly DEFAULT_CONFIG_FILE="z-rapl-init.conf"
+readonly RAPL_PATH="/sys/class/powercap/intel-rapl:0"
+readonly UW_PER_WATT=1000000
+
+readonly TONULL="/dev/null"
+readonly TOOUT="/dev/stdout"
+readonly TOERROR="/dev/stderr"
+
+log() {
+    printf '%s: %s\n' "$MY_NAME" "$*"
+}
+
+log_error() {
+    printf '%s: ERROR: %s\n' "$MY_NAME" "$*" >"$TOERROR"
+}
+
+error() {
+    local RC=${2:-$RC_ERROR}
+    log_error "$1"
+    exit "$RC"
+}
+
+do_check_bash(){
+    if ! bash -n "$1"; then
+        error "Invalid Bash syntax in: $1"
+    fi
+}
+
+usage() {
+    local RC=${1:-$RC_OK}
+    echo "Usage: z-rapl-init  [-s|--status] [-c|--config DIR] [-f|--force] [-h|--help]"
+    exit "$RC"
+}
+
+# Arguments
+ONLY_STATUS=false
+FORCE=false
+CONFIG_DIR="$DEFAULT_CONFIG_DIR"
+
+if ! PARSED=$(getopt -o "shfc:" --long status,force,config:,help -- "$@"); then
+    exit $RC_BAD_OPT
+fi
+
+eval set -- "$PARSED"
+
+while true; do
+    case "$1" in
+        -c|--config)
+            CONFIG_DIR="$2"
+            if [[ ! -d "$CONFIG_DIR" ]]; then
+                log_error "--config must specify an existing directory for the configuration file $DEFAULT_CONFIG_FILE"
+                usage $RC_BAD_OPT
+            fi
+           shift 2
+            ;;
+        -f|--force)
+            FORCE=true
+            shift 1
+            ;;
+        -s|--status)
+            ONLY_STATUS=true
+            shift
+            ;;
+        -h|--help)
+            usage $RC_OK
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            log_error "Invalid option - $1"
+            usage $RC_BAD_OPT >$TOERROR
+            ;;
+    esac
+done
+
+(( $# <= 0 )) || {
+    error "Unexpected positional arguments: $*" $RC_BAD_OPT
+}
+
+# RAPL interfaces
+PL1_FILE="$RAPL_PATH/constraint_0_power_limit_uw"
+PL2_FILE="$RAPL_PATH/constraint_1_power_limit_uw"
+
+[[ -r "$PL1_FILE" && -r "$PL2_FILE" ]] ||
+    error "Cannot read RAPL interfaces"
+
+# Verify RAPL constraint mapping
+[[ -r "$RAPL_PATH/constraint_0_name" &&
+   -r "$RAPL_PATH/constraint_1_name" ]] ||
+    error "Cannot read RAPL constraint names"
+    
+[[ $(<"$RAPL_PATH/constraint_0_name") == "long_term" ]] ||
+    error "Unexpected RAPL constraint_0"
+
+[[ $(<"$RAPL_PATH/constraint_1_name") == "short_term" ]] ||
+    error "Unexpected RAPL constraint_1"
+
+# Read current limits
+CURRENT_PL1=$(<"$PL1_FILE")
+CURRENT_PL2=$(<"$PL2_FILE")
+
+[[ "$CURRENT_PL1" =~ ^[0-9]+$ ]] ||
+    error "Invalid current PL1: $CURRENT_PL1"
+
+[[ "$CURRENT_PL2" =~ ^[0-9]+$ ]] ||
+    error "Invalid current PL2: $CURRENT_PL2"
+
+log "Current: PL1=$((CURRENT_PL1 / UW_PER_WATT))W, PL2=$((CURRENT_PL2 / UW_PER_WATT))W"
+
+if [[ "$ONLY_STATUS" == true ]]; then
+    exit $RC_OK
+fi
+
+# Configuration
+CONFIG_FILE="$CONFIG_DIR/$DEFAULT_CONFIG_FILE"
+[[ -r "$CONFIG_FILE" ]] ||
+    error "Cannot read configuration: $CONFIG_FILE"
+do_check_bash "$CONFIG_FILE"
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
+# Validate configuration
+validate_watts() {
+    local name=$1
+    local value=${!name:-}
+
+    [[ "$value" =~ ^[0-9]{1,3}$ ]] ||
+        error "Invalid $name: $value"
+
+    # Avoid invalid or excessive values and arithmetic overflow.
+    (( 10#$value >= 1 && 10#$value <= 999 )) ||
+        error "$name is out of range: $value"
+
+    printf -v "$name" '%d' "$((10#$value))"
+}
+
+validate_watts "PL1"
+validate_watts "PL2"
+validate_watts "PL1_INITIAL_THRESHOLD"
+validate_watts "PL2_INITIAL_THRESHOLD"
+
+# Check initialization thresholds
+if [[ "$FORCE" != true ]]; then
+    THRESHOLD_PL1=$((PL1_INITIAL_THRESHOLD * UW_PER_WATT))
+    THRESHOLD_PL2=$((PL2_INITIAL_THRESHOLD * UW_PER_WATT))
+
+    if (( CURRENT_PL1 < THRESHOLD_PL1 ||
+          CURRENT_PL2 < THRESHOLD_PL2 )); then
+        log "RAPL already configured; skipping"
+        exit $RC_OK
+    fi
+else
+    log "Force mode enabled"
+fi
+# Apply configured limits
+TARGET_PL1=$((PL1 * UW_PER_WATT))
+TARGET_PL2=$((PL2 * UW_PER_WATT))
+
+[[ -w "$PL1_FILE" && -w "$PL2_FILE" ]] ||
+    error "RAPL interfaces are not writable"
+
+log "Setting PL1=${PL1}W, PL2=${PL2}W"
+
+printf '%s\n' "$TARGET_PL1" > "$PL1_FILE" ||
+    error "Failed to write PL1"
+
+printf '%s\n' "$TARGET_PL2" > "$PL2_FILE" ||
+    error "Failed to write PL2"
+
+# Verify applied values
+APPLIED_PL1=$(<"$PL1_FILE")
+APPLIED_PL2=$(<"$PL2_FILE")
+
+if [[ "$APPLIED_PL1" != "$TARGET_PL1" ||
+      "$APPLIED_PL2" != "$TARGET_PL2" ]]; then
+    error "RAPL verification failed: PL1=$APPLIED_PL1, PL2=$APPLIED_PL2"
+fi
+
+log "RAPL initialized successfully"
+exit $RC_OK
